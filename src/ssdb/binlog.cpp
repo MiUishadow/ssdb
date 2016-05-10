@@ -121,6 +121,7 @@ std::string Binlog::dumps() const{
 			break;
 		case BinlogCommand::QPOP_FRONT:
 			str.append("qpop_front ");
+			break;
 		case BinlogCommand::QSET:
 			str.append("qset ");
 			break;
@@ -150,29 +151,36 @@ static inline uint64_t decode_seq_key(const leveldb::Slice &key){
 	return seq;
 }
 
-BinlogQueue::BinlogQueue(leveldb::DB *db, bool enabled){
+BinlogQueue::BinlogQueue(leveldb::DB *db, bool enabled, int capacity){
 	this->db = db;
 	this->min_seq = 0;
 	this->last_seq = 0;
 	this->tran_seq = 0;
-	this->capacity = LOG_QUEUE_SIZE;
+	this->capacity = capacity;
 	this->enabled = enabled;
 	
 	Binlog log;
 	if(this->find_last(&log) == 1){
 		this->last_seq = log.seq();
 	}
-	if(this->last_seq > LOG_QUEUE_SIZE){
-		this->min_seq = this->last_seq - LOG_QUEUE_SIZE;
+	// 下面这段代码是可能性能非常差!
+	//if(this->find_next(0, &log) == 1){
+	//	this->min_seq = log.seq();
+	//}
+	if(this->last_seq > this->capacity){
+		this->min_seq = this->last_seq - this->capacity;
 	}else{
 		this->min_seq = 0;
 	}
-	// TODO: use binary search to find out min_seq
 	if(this->find_next(this->min_seq, &log) == 1){
 		this->min_seq = log.seq();
 	}
 	if(this->enabled){
-		log_info("binlogs capacity: %d, min: %" PRIu64 ", max: %" PRIu64 ",", capacity, min_seq, last_seq);
+		log_info("binlogs capacity: %d, min: %" PRIu64 ", max: %" PRIu64 ",",
+			this->capacity, this->min_seq, this->last_seq);
+		// 这个方法有性能问题
+		// 但是, 如果不执行清理, 如果将 capacity 修改大, 可能会导致主从同步问题
+		//this->clean_obsolete_binlogs();
 	}
 
 	// start cleaning thread
@@ -359,15 +367,15 @@ void* BinlogQueue::log_clean_thread_func(void *arg){
 		if(!logs->db){
 			break;
 		}
-		usleep(100 * 1000);
 		assert(logs->last_seq >= logs->min_seq);
 
-		if(logs->last_seq - logs->min_seq < LOG_QUEUE_SIZE * 1.1){
+		if(logs->last_seq - logs->min_seq < logs->capacity + 10000){
+			usleep(50 * 1000);
 			continue;
 		}
 		
 		uint64_t start = logs->min_seq;
-		uint64_t end = logs->last_seq - LOG_QUEUE_SIZE;
+		uint64_t end = logs->last_seq - logs->capacity;
 		logs->del_range(start, end);
 		logs->min_seq = end + 1;
 		log_info("clean %d logs[%" PRIu64 " ~ %" PRIu64 "], %d left, max: %" PRIu64 "",
@@ -377,6 +385,34 @@ void* BinlogQueue::log_clean_thread_func(void *arg){
 	
 	logs->thread_quit = false;
 	return (void *)NULL;
+}
+
+// 因为老版本可能产生了断续的binlog
+// 例如, binlog-1 存在, 但后面的被删除了, 然后到 binlog-100000 时又开始存在.
+void BinlogQueue::clean_obsolete_binlogs(){
+	std::string key_str = encode_seq_key(this->min_seq);
+	leveldb::ReadOptions iterate_options;
+	leveldb::Iterator *it = db->NewIterator(iterate_options);
+	it->Seek(key_str);
+	if(it->Valid()){
+		it->Prev();
+	}
+	uint64_t count = 0;
+	while(it->Valid()){
+		leveldb::Slice key = it->key();
+		uint64_t seq = decode_seq_key(key);
+		if(seq == 0){
+			break;
+		}
+		this->del(seq);
+		
+		it->Prev();
+		count ++;
+	}
+	delete it;
+	if(count > 0){
+		log_info("clean_obsolete_binlogs: %" PRIu64, count);
+	}
 }
 
 // TESTING, slow, so not used

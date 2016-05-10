@@ -131,10 +131,8 @@ void Slave::migrate_old_status(){
 }
 
 std::string Slave::status_key(){
-	static std::string key;
-	if(key.empty()){
-		key = "slave.status." + this->id_;
-	}
+	std::string key;
+	key = "slave.status." + this->id_;
 	return key;
 }
 
@@ -337,6 +335,9 @@ int Slave::proc_copy(const Binlog &log, const std::vector<Bytes> &req){
 		case BinlogCommand::BEGIN:
 			log_info("copy begin");
 			log_info("start flushdb...");
+			this->last_seq = 0;
+			this->last_key = "";
+			this->save_status();
 			ssdb->flushdb();
 			log_info("end flushdb.");
 			break;
